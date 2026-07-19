@@ -34,10 +34,10 @@
 //! dropped -- an invalid share can never reach the pool because of a bad kernel.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::pow;
 use crate::protocol::{self, DecodedJob, IncomingLine, JobNotify};
@@ -72,6 +72,12 @@ type GpuHit = (u64, [u8; 32]);
 /// [`handle_line`] -- they never end the connection or panic, matching the
 /// pool server's own defensive posture.
 pub fn run(stream: TcpStream, config: &MinerConfig, gpu: &GpuConfig) -> io::Result<()> {
+    // One persistent kernel process for the whole life of this connection --
+    // the CUDA context init is paid once here, not per batch (see
+    // `KernelServer`). If the pool drops us, `run_reconnecting` calls `run`
+    // again and a fresh server is spawned; the old one is reaped on drop.
+    let mut kernel = KernelServer::spawn(gpu)?;
+
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
@@ -154,7 +160,7 @@ pub fn run(stream: TcpStream, config: &MinerConfig, gpu: &GpuConfig) -> io::Resu
                 continue 'outer;
             }
 
-            let hits = dispatch_batch(gpu, &header_hex, &target_hex, nonce_base, count)?;
+            let hits = kernel.dispatch(&header_hex, &target_hex, nonce_base, count)?;
 
             for (nonce, gpu_hash) in hits {
                 // ── Re-verify on the CPU before trusting the (unvalidated) GPU.
@@ -347,80 +353,119 @@ pub fn run_reconnecting(pool_addr: &str, config: &MinerConfig, gpu: &GpuConfig) 
 
 /// Launch the CUDA search kernel for one batch and parse the nonces it reports.
 ///
-/// Spawns the kernel executable with `(header_hex, target_hex, nonce_start,
-/// count)` and reads `FOUND <nonce_dec> <hash_hex64>` lines from its stdout --
-/// the exact wire the Midstate `midstate_search.cu` uses. Any malformed line is
-/// skipped defensively. A non-zero exit or unreadable stdout is a real error.
-fn dispatch_batch(
-    gpu: &GpuConfig,
-    header_hex: &str,
-    target_hex: &str,
-    nonce_base: u64,
-    count: u64,
-) -> io::Result<Vec<GpuHit>> {
-    let mut cmd = Command::new(&gpu.kernel_path);
-    cmd.arg(header_hex)
-        .arg(target_hex)
-        .arg(nonce_base.to_string())
-        .arg(count.to_string());
-    if let Some(dev) = gpu.device {
-        // Make ONLY this device visible to the child, which then sees it as
-        // device 0 (the kernel always uses device 0). Simple, and needs no
-        // cudaSetDevice inside the kernel.
-        cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
-    }
+/// A PERSISTENT kernel process running in `serve` mode.
+///
+/// The original design spawned the kernel exe once per batch and read its
+/// full stdout (`Command::output()`). That paid the CUDA context +
+/// buffer-allocation cost (~250ms measured) on EVERY batch, throttling a
+/// single-block BLAKE3 -- which the GPU can do in sub-milliseconds for
+/// millions of nonces -- to ~16 MH/s of almost-pure context-init overhead.
+///
+/// This keeps ONE kernel process alive (`kernel serve`), holding the CUDA
+/// context and device buffers, and streams batches to it over stdin,
+/// reading results back over stdout. The ~250ms init is paid once at
+/// startup; every subsequent batch is just a line write + the kernel's
+/// memcpy/launch/sync, so throughput is bounded by the GPU, not by process
+/// spawning. Same `search` kernel and hashing primitives as the one-shot
+/// path (still exercised by `selftest`), so bit-exactness is unchanged.
+struct KernelServer {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
 
-    let output = cmd.output().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "failed to launch CUDA kernel at {}: {e}. Build it with nvcc \
-                 (see README) or pass --kernel <path>.",
-                gpu.kernel_path.display()
-            ),
-        )
-    })?;
-
-    if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "CUDA kernel exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut hits = Vec::new();
-    for line in stdout.lines() {
-        // Expected: "FOUND <nonce_dec> <hash_hex64>"
-        let mut it = line.split_whitespace();
-        if it.next() != Some("FOUND") {
-            continue;
+impl KernelServer {
+    /// Spawn `kernel serve` with piped stdin/stdout. The ~250ms CUDA init
+    /// happens lazily on the first `dispatch`, not here.
+    fn spawn(gpu: &GpuConfig) -> io::Result<Self> {
+        let mut cmd = Command::new(&gpu.kernel_path);
+        cmd.arg("serve").stdin(Stdio::piped()).stdout(Stdio::piped());
+        if let Some(dev) = gpu.device {
+            // Make ONLY this device visible to the child (it sees it as
+            // device 0). Same as before; needs no cudaSetDevice in the kernel.
+            cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
         }
-        let (Some(nonce_tok), Some(hash_tok)) = (it.next(), it.next()) else {
-            eprintln!("[warn] malformed FOUND line from kernel, ignoring: {line}");
-            continue;
-        };
-        let Ok(nonce) = nonce_tok.parse::<u64>() else {
-            eprintln!("[warn] FOUND line has non-numeric nonce, ignoring: {line}");
-            continue;
-        };
-        let Ok(bytes) = hex::decode(hash_tok) else {
-            eprintln!("[warn] FOUND line has non-hex hash, ignoring: {line}");
-            continue;
-        };
-        if bytes.len() != 32 {
-            eprintln!("[warn] FOUND line hash is {} bytes (want 32), ignoring: {line}", bytes.len());
-            continue;
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes);
-        hits.push((nonce, hash));
+        let mut child = cmd.spawn().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to launch CUDA kernel at {} in serve mode: {e}. Build it \
+                     with nvcc (see README) or pass --kernel <path>.",
+                    gpu.kernel_path.display()
+                ),
+            )
+        })?;
+        let stdin = BufWriter::new(child.stdin.take().expect("piped stdin"));
+        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        Ok(KernelServer { child, stdin, stdout })
     }
-    Ok(hits)
+
+    /// Hash one batch: write the request line, then read `FOUND ...` lines
+    /// until the `DONE ...` marker that ends this batch. Reusing the live
+    /// context, so this is GPU-bound, not spawn-bound.
+    fn dispatch(
+        &mut self,
+        header_hex: &str,
+        target_hex: &str,
+        nonce_base: u64,
+        count: u64,
+    ) -> io::Result<Vec<GpuHit>> {
+        writeln!(self.stdin, "{header_hex} {target_hex} {nonce_base} {count}")?;
+        self.stdin.flush()?;
+
+        let mut hits = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line)?;
+            if n == 0 {
+                // Kernel process closed stdout / died -- surface it so run()
+                // returns Err and the reconnect loop respawns everything.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "CUDA kernel serve process ended unexpectedly",
+                ));
+            }
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some("DONE") => break, // this batch is complete
+                Some("FOUND") => {
+                    let (Some(nonce_tok), Some(hash_tok)) = (it.next(), it.next()) else {
+                        eprintln!("[warn] malformed FOUND line from kernel, ignoring: {}", line.trim());
+                        continue;
+                    };
+                    let Ok(nonce) = nonce_tok.parse::<u64>() else {
+                        eprintln!("[warn] FOUND line has non-numeric nonce, ignoring: {}", line.trim());
+                        continue;
+                    };
+                    let Ok(bytes) = hex::decode(hash_tok) else {
+                        eprintln!("[warn] FOUND line has non-hex hash, ignoring: {}", line.trim());
+                        continue;
+                    };
+                    if bytes.len() != 32 {
+                        eprintln!("[warn] FOUND hash is {} bytes (want 32), ignoring: {}", bytes.len(), line.trim());
+                        continue;
+                    }
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&bytes);
+                    hits.push((nonce, hash));
+                }
+                // Anything else (a stray stderr echo, a warning line) is
+                // ignored -- only FOUND/DONE are protocol.
+                _ => {}
+            }
+        }
+        Ok(hits)
+    }
+}
+
+impl Drop for KernelServer {
+    fn drop(&mut self) {
+        // Dropping stdin closes it -> the kernel's fgets loop hits EOF and
+        // exits cleanly; then reap it so we never leak a zombie GPU process.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

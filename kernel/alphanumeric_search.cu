@@ -263,9 +263,77 @@ static int run_selftest() {
     return 0;
 }
 
+// Persistent "serve" mode: the whole point of this is to pay CUDA context +
+// buffer allocation ONCE, then hash many batches without re-initialising.
+// The one-shot argv path below re-creates the CUDA context on every process
+// spawn (~250ms), so a fast single-block BLAKE3 was throttled to ~16 MH/s --
+// 99% context-init overhead, ~1% hashing. This loop keeps the context alive
+// and reuses the device buffers, so each batch is just memcpy + launch +
+// sync (sub-millisecond for millions of nonces), unlocking the GPU's real
+// throughput.
+//
+// Protocol (line-oriented, over stdin/stdout):
+//   in : "<header_hex184> <target_hex64> <nonce_start_u64> <count_u32>\n"
+//   out: zero or more "FOUND <nonce_dec> <hash_hex64>\n" then exactly one
+//        "DONE <nonce_start> <count>\n" per input line, flushed.
+// The `search` kernel and every hashing primitive are IDENTICAL to the
+// one-shot path -- serve mode changes only WHEN buffers are allocated, never
+// HOW a hash is computed, so `selftest`'s bit-exact guarantee still covers it.
+static int run_serve() {
+    uint8_t *d_hdr, *d_tgt;
+    CK(cudaMalloc(&d_hdr, HEADER_LEN));
+    CK(cudaMalloc(&d_tgt, 32));
+    const uint32_t MAX_RESULTS = 4096;
+    Found* d_res; CK(cudaMalloc(&d_res, sizeof(Found) * MAX_RESULTS));
+    uint32_t* d_cnt; CK(cudaMalloc(&d_cnt, 4));
+
+    char line[512];
+    while (fgets(line, sizeof(line), stdin)) {
+        char hdr_hex[256], tgt_hex[128];
+        unsigned long long ns = 0, cnt = 0;
+        if (sscanf(line, "%200s %120s %llu %llu", hdr_hex, tgt_hex, &ns, &cnt) != 4) {
+            printf("DONE %llu %llu\n", ns, cnt); fflush(stdout); continue;
+        }
+        uint8_t h_hdr[HEADER_LEN], h_tgt[32];
+        if (hex_to_bytes(hdr_hex, h_hdr, HEADER_LEN) != 0 ||
+            hex_to_bytes(tgt_hex, h_tgt, 32) != 0 ||
+            cnt == 0 || cnt > 0xFFFFFFFFull) {
+            printf("DONE %llu %llu\n", ns, cnt); fflush(stdout); continue;
+        }
+        uint32_t count = (uint32_t)cnt;
+        CK(cudaMemcpy(d_hdr, h_hdr, HEADER_LEN, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_tgt, h_tgt, 32, cudaMemcpyHostToDevice));
+        CK(cudaMemset(d_cnt, 0, 4));
+
+        int threadsPerBlock = 256;
+        uint64_t blocks = ((uint64_t)count + threadsPerBlock - 1) / threadsPerBlock;
+        search<<<(unsigned)blocks, threadsPerBlock>>>(d_hdr, d_tgt, ns, count, d_res, d_cnt, MAX_RESULTS);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+
+        uint32_t h_cnt = 0; CK(cudaMemcpy(&h_cnt, d_cnt, 4, cudaMemcpyDeviceToHost));
+        uint32_t n = h_cnt < MAX_RESULTS ? h_cnt : MAX_RESULTS;
+        if (n > 0) {
+            Found* h_res = (Found*)malloc(sizeof(Found) * n);
+            CK(cudaMemcpy(h_res, d_res, sizeof(Found) * n, cudaMemcpyDeviceToHost));
+            for (uint32_t i = 0; i < n; i++) {
+                char hex[128]; words_to_hex(h_res[i].words, 8, hex);
+                printf("FOUND %llu %s\n", (unsigned long long)h_res[i].nonce, hex);
+            }
+            free(h_res);
+        }
+        printf("DONE %llu %llu\n", ns, cnt);
+        fflush(stdout);
+    }
+    cudaFree(d_hdr); cudaFree(d_tgt); cudaFree(d_res); cudaFree(d_cnt);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "selftest") == 0) {
         return run_selftest();
+    }
+    if (argc == 2 && strcmp(argv[1], "serve") == 0) {
+        return run_serve();
     }
     if (argc != 5) {
         fprintf(stderr, "usage: %s <header_hex184> <target_hex64> <nonce_start_u64> <count_u32>\n", argv[0]);
