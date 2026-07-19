@@ -14,3 +14,4 @@
 pub mod gpu;
 pub mod pow;
 pub mod protocol;
+pub mod update;

@@ -11,12 +11,17 @@ use std::process::ExitCode;
 
 use alphanumeric_gpu_miner::gpu::{self, GpuConfig, MinerConfig};
 use alphanumeric_gpu_miner::protocol::is_valid_address;
+use alphanumeric_gpu_miner::update::UpdateOptions;
 
 const DEFAULT_POOL_ADDR: &str = "127.0.0.1:3777";
 const DEFAULT_WORKER: &str = "gpu-worker";
 /// Nonces per GPU dispatch. 2^22 amortises subprocess-spawn overhead while
 /// staying well under the kernel's `u32` count limit. Tune per GPU / batch time.
-const DEFAULT_BATCH: u64 = 4_194_304;
+// 64M nonces/batch. With the persistent kernel + constant-memory hot path,
+// this runs in ~19ms on an RTX 5070 Ti (~3.4 GH/s) -- big enough to amortise
+// the per-batch pipe round-trip and kernel launch, small enough to stay
+// responsive to new jobs / vardiff target changes (checked between batches).
+const DEFAULT_BATCH: u64 = 67_108_864;
 
 /// Where `build.rs` placed the compiled kernel exe (always set by build.rs,
 /// even when it skipped the nvcc compile -- the file may therefore not exist).
@@ -29,6 +34,11 @@ struct Args {
     device: Option<usize>,
     batch: u64,
     kernel: Option<String>,
+    /// `--auto-update`: apply a found update (sha256-verified) and re-exec.
+    /// Default is off -- notify only.
+    auto_update: bool,
+    /// `--no-update-check`: disable the update check entirely.
+    no_update_check: bool,
 }
 
 fn print_usage() {
@@ -43,7 +53,10 @@ fn print_usage() {
          --batch     optional. Nonces per GPU dispatch (1..=4294967295), default: {DEFAULT_BATCH}.\n\
          --threads   optional. Alias for --batch.\n\
          --kernel    optional. Path to the compiled alphanumeric_search kernel exe.\n\
-         \x20                   Default (from build.rs): {BUILT_KERNEL_PATH}"
+         \x20                   Default (from build.rs): {BUILT_KERNEL_PATH}\n\
+         --auto-update      optional. Apply a newer version automatically (sha256-verified, then\n\
+         \x20                         re-exec). Default: OFF -- just notify you one is available.\n\
+         --no-update-check  optional. Disable the periodic update check entirely."
     );
 }
 
@@ -54,6 +67,8 @@ fn parse_args() -> Result<Args, String> {
     let mut device: Option<usize> = None;
     let mut batch: u64 = DEFAULT_BATCH;
     let mut kernel: Option<String> = None;
+    let mut auto_update = false;
+    let mut no_update_check = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -70,6 +85,8 @@ fn parse_args() -> Result<Args, String> {
                 batch = v.parse().map_err(|_| format!("--batch must be a positive integer, got: {v}"))?;
             }
             "--kernel" => kernel = Some(args.next().ok_or("--kernel requires a value")?),
+            "--auto-update" => auto_update = true,
+            "--no-update-check" => no_update_check = true,
             "-h" | "--help" => return Err(String::new()), // triggers usage print, no error text
             other => return Err(format!("unrecognized argument: {other}")),
         }
@@ -80,7 +97,7 @@ fn parse_args() -> Result<Args, String> {
     }
 
     let address = address.ok_or("--address is required")?;
-    Ok(Args { pool, address, worker, device, batch, kernel })
+    Ok(Args { pool, address, worker, device, batch, kernel, auto_update, no_update_check })
 }
 
 fn main() -> ExitCode {
@@ -119,11 +136,17 @@ fn main() -> ExitCode {
 
     let config = MinerConfig { address: args.address, worker: args.worker };
     let gpu_config = GpuConfig { kernel_path, device: args.device, batch: args.batch };
+    // Safe default: check for updates and NOTIFY only. `--auto-update` opts into
+    // the sha256-verified auto-apply; `--no-update-check` disables the check.
+    let update = UpdateOptions {
+        check_enabled: !args.no_update_check,
+        auto_update: args.auto_update,
+    };
     // Mine forever, reconnecting across pool restarts (deploys drop every
     // miner's socket -- see `gpu::run_reconnecting`). This call never returns:
     // it redials on every connection drop, so the process ends only when killed.
     // The config-error exits above still return non-zero -- a bad address or a
     // missing kernel is fatal, but the pool being temporarily down is exactly
     // what we now ride out instead of exiting on.
-    gpu::run_reconnecting(&args.pool, &config, &gpu_config)
+    gpu::run_reconnecting(&args.pool, &config, &gpu_config, update)
 }

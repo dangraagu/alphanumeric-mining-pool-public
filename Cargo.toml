@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric-gpu-miner"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "CUDA GPU miner for the alphanumeric mining pool (a#) share-distribution protocol. Speaks the identical wire protocol as the CPU miner; grinds nonces on the GPU via a single-BLAKE3-of-a-92-byte-header kernel adapted from the Midstate GPU miner."
@@ -33,3 +33,8 @@ blake3 = "1.4"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Self-update (src/update.rs): ureq = tiny blocking HTTP client (matches the
+# synchronous std::net miner; rustls default features -> https with no system
+# OpenSSL on Windows); sha2 = the mandatory sha256 verification of the download.
+ureq = "2"
+sha2 = "0.10"

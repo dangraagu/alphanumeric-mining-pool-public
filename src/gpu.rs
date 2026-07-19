@@ -310,7 +310,18 @@ fn backoff_secs(attempt: u32) -> u64 {
 /// Connect to `pool_addr` and mine on the GPU, reconnecting forever whenever the
 /// connection drops (see this section's comment for why). Never returns: the
 /// only way out is the process being killed.
-pub fn run_reconnecting(pool_addr: &str, config: &MinerConfig, gpu: &GpuConfig) -> ! {
+///
+/// `update` controls the safe, sha256-pinned self-update (see [`crate::update`]):
+/// a leftover `<exe>.old` from a previous update is cleaned up once at startup,
+/// then every outer iteration ticks the update check -- throttled to ~6h -- which
+/// logs, and under `--auto-update` verifies + installs + re-execs. Any update
+/// failure is logged and mining continues; it can never stop the miner.
+pub fn run_reconnecting(
+    pool_addr: &str,
+    config: &MinerConfig,
+    gpu: &GpuConfig,
+    update: crate::update::UpdateOptions,
+) -> ! {
     // Consecutive failed/short connections since the last successful dial. Drives
     // the backoff and is reset to 0 the moment a dial succeeds -- a successful
     // connect means the pool is back up and accepted us, and `run` writes
@@ -320,7 +331,17 @@ pub fn run_reconnecting(pool_addr: &str, config: &MinerConfig, gpu: &GpuConfig) 
     // is still down (connect keeps failing) keeps growing it.
     let mut consecutive_failures: u32 = 0;
 
+    // Self-update bookkeeping. Clean up a leftover `.old` from a prior update,
+    // then track when we last checked so `tick` can throttle to ~6h. `None`
+    // means "never checked", so the FIRST outer iteration checks on startup.
+    crate::update::cleanup_old_binary();
+    let mut last_update_check: Option<std::time::Instant> = None;
+
     loop {
+        // Runs on startup (last_update_check == None) and ~every 6h thereafter.
+        // On a successful `--auto-update` this re-execs and never returns.
+        last_update_check = crate::update::tick(update, last_update_check, env!("CARGO_PKG_VERSION"));
+
         println!("[connect] dialing pool at {pool_addr}...");
         match TcpStream::connect(pool_addr) {
             Ok(stream) => {
