@@ -264,6 +264,87 @@ pub fn run(stream: TcpStream, config: &MinerConfig, gpu: &GpuConfig) -> io::Resu
     }
 }
 
+// ── Auto-reconnect across pool restarts (reused from the CPU miner) ──────────
+//
+// The pool process is restarted for deploys. When it goes down every miner's
+// TCP socket drops: the blocking read returns a clean EOF (`Ok(None)` from
+// `read_line`, which `run` surfaces as `Ok(())`) or a read/write fails with a
+// real I/O error (`Err`). Either way `run` RETURNS -- and the original entry
+// point then exited (or sat idle) the instant the pool bounced. That is exactly
+// the observed "pool restarted, miner froze / never came back" failure.
+//
+// A miner has exactly ONE pool and must never give up on it. `run_reconnecting`
+// wraps the entire dial -> subscribe -> authorize -> mine lifecycle (`run`
+// itself does the last three) in an outer loop that, on ANY connection end,
+// waits a short backoff and redials -- forever, until the process is killed.
+// `run` is left completely unchanged: it still drives exactly one connection to
+// completion; this just keeps handing it fresh ones. Identical policy to the CPU
+// miner's `miner.rs`.
+
+/// Reconnect backoff bounds, in seconds. Starts small so a quick pool bounce is
+/// barely noticed; caps low because a miner has one pool -- there is never a
+/// reason to wait longer than this between retries.
+const RECONNECT_BACKOFF_MIN_SECS: u64 = 2;
+const RECONNECT_BACKOFF_MAX_SECS: u64 = 30;
+
+/// Pure backoff policy: given the number of consecutive failed connection
+/// attempts (1-based; 1 = the first retry after a drop), return how many
+/// seconds to wait before the next dial. Capped exponential: 2, 4, 8, 16, 30,
+/// 30, ... -- doubles each time up to the cap, then holds. Kept a pure
+/// `attempt -> secs` function so the policy is unit-testable without any
+/// sockets or real sleeping (see this module's tests).
+fn backoff_secs(attempt: u32) -> u64 {
+    // Clamp the shift BEFORE shifting so `1 << shift` can never overflow, then
+    // clamp the result to the max. `attempt` is 1-based, so attempt 1 => shift 0.
+    let shift = attempt.saturating_sub(1).min(20);
+    let delay = RECONNECT_BACKOFF_MIN_SECS.saturating_mul(1u64 << shift);
+    delay.min(RECONNECT_BACKOFF_MAX_SECS)
+}
+
+/// Connect to `pool_addr` and mine on the GPU, reconnecting forever whenever the
+/// connection drops (see this section's comment for why). Never returns: the
+/// only way out is the process being killed.
+pub fn run_reconnecting(pool_addr: &str, config: &MinerConfig, gpu: &GpuConfig) -> ! {
+    // Consecutive failed/short connections since the last successful dial. Drives
+    // the backoff and is reset to 0 the moment a dial succeeds -- a successful
+    // connect means the pool is back up and accepted us, and `run` writes
+    // `subscribe` + `authorize` immediately, so a landed dial IS the
+    // reconnect+authorize milestone. Resetting here means the NEXT drop after a
+    // healthy session starts from the minimum backoff again, while a pool that
+    // is still down (connect keeps failing) keeps growing it.
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        println!("[connect] dialing pool at {pool_addr}...");
+        match TcpStream::connect(pool_addr) {
+            Ok(stream) => {
+                consecutive_failures = 0;
+                println!(
+                    "[connect] connected. subscribing + authorizing as address={} worker={} \
+                     (gpu device={:?} batch={} kernel={})",
+                    config.address,
+                    config.worker,
+                    gpu.device,
+                    gpu.batch,
+                    gpu.kernel_path.display()
+                );
+                match run(stream, config, gpu) {
+                    Ok(()) => println!("[reconnect] pool closed the connection"),
+                    Err(e) => eprintln!("[reconnect] connection dropped: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[reconnect] could not reach pool at {pool_addr}: {e}"),
+        }
+
+        // The connection ended (clean close, I/O error, or the dial never
+        // landed). Back off, then redial -- a miner never abandons its pool.
+        consecutive_failures = consecutive_failures.saturating_add(1);
+        let secs = backoff_secs(consecutive_failures);
+        println!("[reconnect] connection lost, retrying in {secs}s...");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+}
+
 /// Launch the CUDA search kernel for one batch and parse the nonces it reports.
 ///
 /// Spawns the kernel executable with `(header_hex, target_hex, nonce_start,
@@ -487,5 +568,30 @@ fn read_line(reader: &mut BufReader<TcpStream>) -> io::Result<Option<String>> {
             continue;
         }
         return Ok(Some(trimmed.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_capped_exponential_and_never_exceeds_the_max() {
+        // 1-based attempt: doubles from the minimum, then holds at the cap.
+        assert_eq!(backoff_secs(1), 2);
+        assert_eq!(backoff_secs(2), 4);
+        assert_eq!(backoff_secs(3), 8);
+        assert_eq!(backoff_secs(4), 16);
+        // 2 * 2^4 = 32 would exceed the 30s cap -- clamped.
+        assert_eq!(backoff_secs(5), RECONNECT_BACKOFF_MAX_SECS);
+        assert_eq!(backoff_secs(6), RECONNECT_BACKOFF_MAX_SECS);
+        // Huge attempt counts must stay clamped and never overflow or panic.
+        assert_eq!(backoff_secs(1_000), RECONNECT_BACKOFF_MAX_SECS);
+        assert_eq!(backoff_secs(u32::MAX), RECONNECT_BACKOFF_MAX_SECS);
+    }
+
+    #[test]
+    fn backoff_first_retry_is_the_configured_minimum() {
+        assert_eq!(backoff_secs(1), RECONNECT_BACKOFF_MIN_SECS);
     }
 }

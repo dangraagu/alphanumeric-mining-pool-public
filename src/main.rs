@@ -6,7 +6,6 @@
 //! `--pool`/`--address`/`--worker` flags are IDENTICAL to the CPU miner; the
 //! GPU-specific `--device`/`--batch`/`--kernel` flags are additive.
 
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -118,29 +117,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("[connect] dialing pool at {}...", args.pool);
-    let stream = match TcpStream::connect(&args.pool) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: could not connect to pool at {}: {e}", args.pool);
-            return ExitCode::FAILURE;
-        }
-    };
-    println!(
-        "[connect] connected. subscribing + authorizing as address={} worker={} (gpu device={:?} batch={} kernel={})",
-        args.address, args.worker, args.device, args.batch, kernel_path.display()
-    );
-
     let config = MinerConfig { address: args.address, worker: args.worker };
     let gpu_config = GpuConfig { kernel_path, device: args.device, batch: args.batch };
-    match gpu::run(stream, &config, &gpu_config) {
-        Ok(()) => {
-            println!("[connect] pool closed the connection.");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: connection to pool ended with an I/O error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    // Mine forever, reconnecting across pool restarts (deploys drop every
+    // miner's socket -- see `gpu::run_reconnecting`). This call never returns:
+    // it redials on every connection drop, so the process ends only when killed.
+    // The config-error exits above still return non-zero -- a bad address or a
+    // missing kernel is fatal, but the pool being temporarily down is exactly
+    // what we now ride out instead of exiting on.
+    gpu::run_reconnecting(&args.pool, &config, &gpu_config)
 }
