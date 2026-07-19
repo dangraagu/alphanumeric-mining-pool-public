@@ -113,15 +113,24 @@ __device__ __forceinline__ void compress(const uint32_t cv[8], const uint32_t ms
 // Returns the 32-byte root digest (little-endian per word, == blake3 as_bytes()).
 // nonce is spliced at bytes [44..52) (word-aligned): m0[11]=lo32, m0[12]=hi32.
 // ─────────────────────────────────────────────────────────────────────────────
-__device__ __forceinline__ void hash_header_92(const uint8_t* header, uint64_t nonce, uint32_t x[8]) {
+// ── PERF: the header and target are IDENTICAL for every thread in a batch, so
+// they live in constant memory (broadcast to a whole warp in one fetch, and
+// cached) instead of global memory read per thread. And since the 92-byte
+// header only varies in the 8 nonce bytes [44..52), the fixed message words
+// are PRE-PACKED on the host once per batch into `c_m0`/`c_m1` -- the kernel
+// then skips the 23-word byte->word repacking every thread used to do, setting
+// only the two nonce words. `c_m0[11]`/`c_m0[12]` hold the nonce=0 placeholder
+// and are overwritten per-thread below. This changes only WHERE the same bytes
+// come from and WHEN they are packed -- never the hash math, so bit-exactness
+// (selftest vs pow.rs) is unchanged.
+__constant__ uint32_t c_m0[16];    // block-0 message words (nonce words = placeholder)
+__constant__ uint32_t c_m1[16];    // block-1 message words (fixed: 7 words + zero pad)
+__constant__ uint8_t  c_target[32];
+
+__device__ __forceinline__ void hash_header_92(uint64_t nonce, uint32_t x[8]) {
     uint32_t m0[16];
 #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        m0[i] = (uint32_t)header[4*i]
-              | ((uint32_t)header[4*i+1] << 8)
-              | ((uint32_t)header[4*i+2] << 16)
-              | ((uint32_t)header[4*i+3] << 24);
-    }
+    for (int i = 0; i < 16; i++) m0[i] = c_m0[i];
     m0[11] = (uint32_t)(nonce & 0xFFFFFFFFu);   // nonce bytes [44..48)
     m0[12] = (uint32_t)(nonce >> 32);           // nonce bytes [48..52)
 
@@ -133,15 +142,22 @@ __device__ __forceinline__ void hash_header_92(const uint8_t* header, uint64_t n
 
     uint32_t m1[16];
 #pragma unroll
-    for (int i = 0; i < 16; i++) m1[i] = 0u;
-#pragma unroll
-    for (int i = 0; i < 7; i++) {               // header[64..92) = 28 bytes = 7 words
-        m1[i] = (uint32_t)header[64 + 4*i]
-              | ((uint32_t)header[64 + 4*i+1] << 8)
-              | ((uint32_t)header[64 + 4*i+2] << 16)
-              | ((uint32_t)header[64 + 4*i+3] << 24);
-    }
+    for (int i = 0; i < 16; i++) m1[i] = c_m1[i];
     compress(cv1, m1, 28u, FLAG_CHUNK_END | FLAG_ROOT, x);
+}
+
+// Host-side packing of the 92-byte header into the two 16-word blake3 message
+// blocks, byte-for-byte identical to what the kernel used to do per thread
+// (little-endian word assembly). Called once per batch; result goes to
+// c_m0/c_m1 via cudaMemcpyToSymbol.
+static void pack_header_words(const uint8_t* hdr, uint32_t m0[16], uint32_t m1[16]) {
+    for (int i = 0; i < 16; i++)
+        m0[i] = (uint32_t)hdr[4*i] | ((uint32_t)hdr[4*i+1] << 8)
+              | ((uint32_t)hdr[4*i+2] << 16) | ((uint32_t)hdr[4*i+3] << 24);
+    for (int i = 0; i < 16; i++) m1[i] = 0u;
+    for (int i = 0; i < 7; i++)  // header[64..92) = 28 bytes = 7 words
+        m1[i] = (uint32_t)hdr[64+4*i] | ((uint32_t)hdr[64+4*i+1] << 8)
+              | ((uint32_t)hdr[64+4*i+2] << 16) | ((uint32_t)hdr[64+4*i+3] << 24);
 }
 
 // alphanumeric uses hash <= target (LESS-THAN-OR-EQUAL), matching
@@ -149,11 +165,11 @@ __device__ __forceinline__ void hash_header_92(const uint8_t* header, uint64_t n
 // (x[j/4] >> (8*(j%4))) & 0xff (the little-endian-per-word layout that
 // blake3::hash().as_bytes() produces, which Rust then compares lexicographically
 // from index 0). Returns true when hash <= target.
-__device__ __forceinline__ bool le_target(const uint32_t x[8], const uint8_t* target_be) {
+__device__ __forceinline__ bool le_target(const uint32_t x[8]) {
 #pragma unroll
     for (int j = 0; j < 32; j++) {
         uint8_t hb = (uint8_t)((x[j >> 2] >> (8 * (j & 3))) & 0xff);
-        uint8_t tb = target_be[j];
+        uint8_t tb = c_target[j];   // constant-memory broadcast
         if (hb < tb) return true;
         if (hb > tb) return false;
     }
@@ -163,22 +179,26 @@ __device__ __forceinline__ bool le_target(const uint32_t x[8], const uint8_t* ta
 // out_nonce/out_words filled for FOUND threads via an atomic result counter.
 struct Found { uint64_t nonce; uint32_t words[8]; };
 
-__global__ void search(const uint8_t* header, const uint8_t* target_be,
-                       uint64_t nonce_base, uint32_t count,
-                       Found* results, uint32_t* result_count, uint32_t max_results) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= count) return;
-    uint64_t nonce = nonce_base + (uint64_t)tid;
-
-    uint32_t x[8];
-    hash_header_92(header, nonce, x);
-
-    if (le_target(x, target_be)) {
-        uint32_t slot = atomicAdd(result_count, 1u);
-        if (slot < max_results) {
-            results[slot].nonce = nonce;
+// __launch_bounds__(256): tell the compiler the block size is fixed at 256 so
+// it can budget registers for full occupancy rather than assuming the worst.
+// A grid-stride loop lets one launch cover an arbitrarily large batch with a
+// bounded grid, so per-launch overhead is amortised across many nonces.
+__global__ void __launch_bounds__(256) search(
+        uint64_t nonce_base, uint32_t count,
+        Found* results, uint32_t* result_count, uint32_t max_results) {
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < count; tid += stride) {
+        uint64_t nonce = nonce_base + tid;
+        uint32_t x[8];
+        hash_header_92(nonce, x);
+        if (le_target(x)) {
+            uint32_t slot = atomicAdd(result_count, 1u);
+            if (slot < max_results) {
+                results[slot].nonce = nonce;
 #pragma unroll
-            for (int i = 0; i < 8; i++) results[slot].words[i] = x[i];
+                for (int i = 0; i < 8; i++) results[slot].words[i] = x[i];
+            }
         }
     }
 }
@@ -209,21 +229,42 @@ static int hex_to_bytes(const char* hex, uint8_t* out, int nbytes) {
 
 #define CK(call) do { cudaError_t e=(call); if(e!=cudaSuccess){ fprintf(stderr,"CUDA ERR %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); return 2; } } while(0)
 
+// Pack the header + target for this (job, difficulty) and upload them to
+// constant memory. Call before launching `search` whenever either changes.
+static int upload_job(const uint8_t* h_hdr, const uint8_t* h_tgt) {
+    uint32_t m0[16], m1[16];
+    pack_header_words(h_hdr, m0, m1);
+    CK(cudaMemcpyToSymbol(c_m0, m0, sizeof(m0)));
+    CK(cudaMemcpyToSymbol(c_m1, m1, sizeof(m1)));
+    CK(cudaMemcpyToSymbol(c_target, h_tgt, 32));
+    return 0;
+}
+
+// Grid size for a batch: enough 256-thread blocks to cover `count`, capped so
+// the grid stays sane -- the kernel's grid-stride loop covers any remainder.
+static unsigned grid_for(uint32_t count) {
+    const unsigned TPB = 256;
+    unsigned long long want = ((unsigned long long)count + TPB - 1) / TPB;
+    unsigned long long cap = 65535ull; // one launch, plenty of blocks in flight
+    return (unsigned)(want < cap ? want : cap);
+}
+
 // Hash a single (header, nonce) on the GPU and return its hex digest (for selftest).
 static int hash_one(const uint8_t h_hdr[HEADER_LEN], uint64_t nonce, char out_hex[65]) {
-    uint8_t* d_hdr; CK(cudaMalloc(&d_hdr, HEADER_LEN)); CK(cudaMemcpy(d_hdr, h_hdr, HEADER_LEN, cudaMemcpyHostToDevice));
-    // target all-0xFF so every thread is "found" -- we only want the digest.
+    // target all-0xFF so the single thread is always "found" -- we only want
+    // the digest. Same constant-memory path the real search uses, so the
+    // selftest validates exactly the production hash.
     uint8_t h_tgt[32]; memset(h_tgt, 0xFF, 32);
-    uint8_t* d_tgt; CK(cudaMalloc(&d_tgt, 32)); CK(cudaMemcpy(d_tgt, h_tgt, 32, cudaMemcpyHostToDevice));
+    { int rc = upload_job(h_hdr, h_tgt); if (rc) return rc; }
     Found* d_res; CK(cudaMalloc(&d_res, sizeof(Found)));
     uint32_t* d_cnt; CK(cudaMalloc(&d_cnt, 4)); CK(cudaMemset(d_cnt, 0, 4));
 
-    search<<<1,1>>>(d_hdr, d_tgt, nonce, 1u, d_res, d_cnt, 1u);
+    search<<<1,1>>>(nonce, 1u, d_res, d_cnt, 1u);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
     Found h_res; CK(cudaMemcpy(&h_res, d_res, sizeof(Found), cudaMemcpyDeviceToHost));
     words_to_hex(h_res.words, 8, out_hex);
-    cudaFree(d_hdr); cudaFree(d_tgt); cudaFree(d_res); cudaFree(d_cnt);
+    cudaFree(d_res); cudaFree(d_cnt);
     return 0;
 }
 
@@ -280,9 +321,8 @@ static int run_selftest() {
 // one-shot path -- serve mode changes only WHEN buffers are allocated, never
 // HOW a hash is computed, so `selftest`'s bit-exact guarantee still covers it.
 static int run_serve() {
-    uint8_t *d_hdr, *d_tgt;
-    CK(cudaMalloc(&d_hdr, HEADER_LEN));
-    CK(cudaMalloc(&d_tgt, 32));
+    // header + target now live in constant memory (uploaded per batch via
+    // upload_job); no global d_hdr/d_tgt buffers needed.
     const uint32_t MAX_RESULTS = 4096;
     Found* d_res; CK(cudaMalloc(&d_res, sizeof(Found) * MAX_RESULTS));
     uint32_t* d_cnt; CK(cudaMalloc(&d_cnt, 4));
@@ -301,13 +341,10 @@ static int run_serve() {
             printf("DONE %llu %llu\n", ns, cnt); fflush(stdout); continue;
         }
         uint32_t count = (uint32_t)cnt;
-        CK(cudaMemcpy(d_hdr, h_hdr, HEADER_LEN, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_tgt, h_tgt, 32, cudaMemcpyHostToDevice));
+        { int rc = upload_job(h_hdr, h_tgt); if (rc) return rc; }
         CK(cudaMemset(d_cnt, 0, 4));
 
-        int threadsPerBlock = 256;
-        uint64_t blocks = ((uint64_t)count + threadsPerBlock - 1) / threadsPerBlock;
-        search<<<(unsigned)blocks, threadsPerBlock>>>(d_hdr, d_tgt, ns, count, d_res, d_cnt, MAX_RESULTS);
+        search<<<grid_for(count), 256>>>(ns, count, d_res, d_cnt, MAX_RESULTS);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
         uint32_t h_cnt = 0; CK(cudaMemcpy(&h_cnt, d_cnt, 4, cudaMemcpyDeviceToHost));
@@ -324,7 +361,7 @@ static int run_serve() {
         printf("DONE %llu %llu\n", ns, cnt);
         fflush(stdout);
     }
-    cudaFree(d_hdr); cudaFree(d_tgt); cudaFree(d_res); cudaFree(d_cnt);
+    cudaFree(d_res); cudaFree(d_cnt);
     return 0;
 }
 
@@ -354,17 +391,13 @@ int main(int argc, char** argv) {
     if (count64 == 0 || count64 > 0xFFFFFFFFull) { fprintf(stderr, "count must be 1..2^32-1\n"); return 3; }
     uint32_t count = (uint32_t)count64;
 
-    uint8_t *d_hdr, *d_tgt;
-    CK(cudaMalloc(&d_hdr, HEADER_LEN)); CK(cudaMemcpy(d_hdr, h_hdr, HEADER_LEN, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&d_tgt, 32)); CK(cudaMemcpy(d_tgt, h_tgt, 32, cudaMemcpyHostToDevice));
+    { int rc = upload_job(h_hdr, h_tgt); if (rc) return rc; }
 
-    const uint32_t MAX_RESULTS = 4096; // plenty for one throttled batch
+    const uint32_t MAX_RESULTS = 4096;
     Found* d_res; CK(cudaMalloc(&d_res, sizeof(Found) * MAX_RESULTS));
     uint32_t* d_cnt; CK(cudaMalloc(&d_cnt, 4)); CK(cudaMemset(d_cnt, 0, 4));
 
-    int threadsPerBlock = 256;
-    uint64_t blocks = ((uint64_t)count + threadsPerBlock - 1) / threadsPerBlock;
-    search<<<(unsigned)blocks, threadsPerBlock>>>(d_hdr, d_tgt, nonce_start, count, d_res, d_cnt, MAX_RESULTS);
+    search<<<grid_for(count), 256>>>(nonce_start, count, d_res, d_cnt, MAX_RESULTS);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
     uint32_t h_cnt = 0; CK(cudaMemcpy(&h_cnt, d_cnt, 4, cudaMemcpyDeviceToHost));
