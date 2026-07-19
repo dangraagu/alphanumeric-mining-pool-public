@@ -1,0 +1,35 @@
+[package]
+name = "alphanumeric-gpu-miner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "CUDA GPU miner for the alphanumeric mining pool (a#) share-distribution protocol. Speaks the identical wire protocol as the CPU miner; grinds nonces on the GPU via a single-BLAKE3-of-a-92-byte-header kernel adapted from the Midstate GPU miner."
+publish = false
+
+# ── Dependency provenance ───────────────────────────────────────────────────
+# Deps are the alphanumeric CPU miner's deps VERBATIM (blake3/hex/serde/serde_json).
+#   * blake3     -> host-side REFERENCE hashing: every nonce the GPU reports is
+#                   re-verified on the CPU with blake3 before it is submitted, so
+#                   a buggy/unvalidated kernel can never push an invalid share.
+#   * serde/json -> the newline-delimited-JSON pool protocol (copied module).
+# NOTE: the CPU miner is synchronous std::net::TcpStream, NOT tokio. This miner
+# reuses that synchronous client loop verbatim, so there is intentionally NO
+# tokio dependency (see README "Divergences from the task brief").
+
+[lib]
+name = "alphanumeric_gpu_miner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alphanumeric-gpu-miner"
+path = "src/main.rs"
+
+[[example]]
+name = "reference_vectors"
+path = "examples/reference_vectors.rs"
+
+[dependencies]
+blake3 = "1.4"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
