@@ -27,7 +27,7 @@
 //!   launcher. The rest of this file does not care which backend is used.
 //!
 //! ── Safety net: every GPU hit is re-verified on the CPU ──────────────────────
-//! The CUDA kernel is UNVALIDATED (see the crate README + `tests/bit_exact_TODO.md`).
+//! The CUDA kernel is bit-exact VERIFIED (see `tests/bit-exact-check.md`); even so,
 //! So before ANY nonce is submitted, the host recomputes the hash with the
 //! reference `pow::header_hash` and re-checks `pow::meets_target`. A GPU-reported
 //! nonce that fails this check is logged loudly (it indicates a kernel bug) and
@@ -176,7 +176,7 @@ pub fn run(stream: TcpStream, config: &MinerConfig, gpu: &GpuConfig) -> io::Resu
                     eprintln!(
                         "[gpu-bug] kernel hash != reference for nonce={nonce} job_id={} \
                          (gpu={} ref={}) -- DROPPING. The CUDA kernel is not bit-exact; \
-                         run the bit-exact gate (tests/bit_exact_TODO.md).",
+                         run the bit-exact gate (tests/bit-exact-check.md).",
                         job.job_id,
                         hex::encode(gpu_hash),
                         hex::encode(ref_hash)

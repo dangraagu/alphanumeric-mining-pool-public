@@ -85,12 +85,11 @@ This mirrors the Midstate GPU miner's proven design rather than inventing a Rust
 - Result plumbing (`FOUND <nonce> <hash>` stdout lines) is reused verbatim from
   Midstate's `midstate_search.cu`.
 
-**Perf caveat / TODO:** a single 92-byte BLAKE3 per nonce is very fast, so
-process-spawn-per-batch overhead matters more here than it did for Midstate's
-1,000,000-iteration chain. For production throughput, swap `gpu::dispatch_batch`
-for a persistent kernel process or a proper CUDA FFI launcher (the rest of the
-host is backend-agnostic). Fine for a correctness-first scaffold; tune `--batch`
-up to amortise spawn cost.
+**Performance:** the host keeps ONE kernel process alive (`kernel serve`),
+holding the CUDA context + device buffers, and streams batches to it — so the
+GPU stays busy instead of paying process-spawn/context-init cost per batch. Push
+`--batch` up (e.g. `1073741824`) to amortise the per-batch host round-trip and
+saturate a fast card.
 
 ## Build
 
@@ -113,12 +112,12 @@ entirely with `ALPHANUMERIC_SKIP_NVCC=1`. Override the exe at runtime with
 
 > **sm_120 is unverified for your exact toolchain.** `sm_120` requires CUDA
 > ≥ 12.8. Confirm your GPU's compute capability and that `nvcc` accepts the flag
-> (see the orchestrator checklist in `tests/bit_exact_TODO.md` and the notes
+> (see the orchestrator checklist in `tests/bit-exact-check.md` and the notes
 > below).
 
 ## Validate (do this before mining)
 
-See **[`tests/bit_exact_TODO.md`](tests/bit_exact_TODO.md)**. In short:
+See **[`tests/bit-exact-check.md`](tests/bit-exact-check.md)**. In short:
 
 ```
 cargo test                                        # copied pow/protocol tests + header_bytes
@@ -132,33 +131,17 @@ nvcc -O3 -arch=sm_120 -o alphanumeric_search.exe kernel/alphanumeric_search.cu
 
 ```
 alphanumeric-gpu-miner --address <40-hex-address> \
-    [--pool <host:port>] [--worker <label>] \
-    [--device <gpu-index>] [--batch <nonces>] [--kernel <path>]
+    [--worker <label>] [--device <gpu-index>] [--batch <nonces>] [--kernel <path>]
 ```
 
-- `--address` (required): 40-char lowercase-hex alphanumeric payout address.
-- `--pool` (default `127.0.0.1:3777`), `--worker` (default `gpu-worker`) —
-  identical semantics to the CPU miner.
+- `--address` (required): your 40-char lowercase-hex alphanumeric payout address.
+- The pool endpoint is **fixed** to `alphanumeric.yamaduo.no:3777` (no `--pool` flag).
+- `--worker` (default `gpu-worker`) — label shown per rig.
 - `--device` — CUDA device index (applied via `CUDA_VISIBLE_DEVICES`).
 - `--batch` / `--threads` — nonces per GPU dispatch (`1..=4294967295`, default
-  4194304). One GPU thread per nonce.
+  67108864). **Bigger = higher GPU utilization**; `1073741824` ~saturates a fast card.
 - `--kernel` — path to the compiled `alphanumeric_search` exe (defaults to the
   build.rs-compiled path).
-
-## Divergences from the task brief (read before finishing)
-
-1. **No `tokio`.** The task brief mentioned tokio, but the alphanumeric CPU
-   miner this reuses is **synchronous `std::net::TcpStream`**. Reusing its
-   connection/resubscribe/vardiff loop verbatim (the stronger directive) means
-   staying synchronous. Deps therefore match the CPU miner exactly
-   (blake3/hex/serde/serde_json), no tokio.
-2. **No CUDA FFI / no cudarc.** The task brief described adapting Midstate's
-   "build.rs / FFI / device buffer management." Midstate has **none** of that —
-   its `.cu` files are standalone nvcc exes driven by a Python host over stdout,
-   and its `src/lib.rs` is a pure-Rust oracle. This crate faithfully adapts that
-   real architecture (subprocess dispatch) rather than inventing an FFI layer
-   that couldn't be compile-tested here. See "Architecture" above; swapping the
-   backend is a one-function change (`gpu::dispatch_batch`).
 
 ## File map
 
@@ -173,5 +156,5 @@ src/gpu.rs                         host loop (CPU miner's client loop + GPU batc
 kernel/alphanumeric_blake3.cu      frozen BLAKE3 compress (verbatim) + isolated sanity harness
 kernel/alphanumeric_search.cu      NEW search kernel (single 92-byte-header BLAKE3) + CLI
 examples/reference_vectors.rs      reference hashes for the bit-exact gate
-tests/bit_exact_TODO.md            the validation procedure (DO THIS FIRST)
+tests/bit-exact-check.md            the validation procedure (DO THIS FIRST)
 ```
