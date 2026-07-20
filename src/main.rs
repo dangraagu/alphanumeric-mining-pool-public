@@ -3,7 +3,7 @@
 //!
 //! Argument parsing is hand-rolled (matching the CPU miner's style): the flag
 //! set is small, so a CLI-parsing crate would outweigh what it saves. The
-//! `--pool`/`--address`/`--worker` flags are IDENTICAL to the CPU miner; the
+//! `--address`/`--worker` flags are IDENTICAL to the CPU miner (the pool endpoint is hardcoded); the
 //! GPU-specific `--device`/`--batch`/`--kernel` flags are additive.
 
 use std::path::PathBuf;
