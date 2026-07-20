@@ -495,8 +495,13 @@ impl Drop for KernelServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// How long [`drain_immediately_available`] waits for one more line before
-/// giving up and assuming nothing else is queued.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// giving up and assuming nothing else is queued. Kept SHORT: an
+/// already-queued complete line is returned instantly regardless of this value
+/// (TCP already delivered it), so this only bounds the IDLE wait when nothing
+/// is pending -- which is the common between-batch case. At 200ms the GPU sat
+/// idle ~200ms after every ~18ms batch (~6% util); 2ms restores near-GPU-bound
+/// throughput. A line arriving mid-window is self-healing (dropped, re-pushed).
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Opportunistically reads and handles any additional line(s) ALREADY sitting
 /// in the socket right behind the one just read. Temporarily switches the
