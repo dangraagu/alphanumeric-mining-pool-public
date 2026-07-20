@@ -15,7 +15,7 @@
 //! CPU miner hashes, so the GPU host can hex-encode it and hand it to the CUDA
 //! kernel. `header_hash` is left byte-for-byte identical to the CPU miner's copy
 //! and is the REFERENCE the CUDA kernel must reproduce bit-for-bit
-//! (see `tests/bit_exact_TODO.md`); the GPU host uses it to re-verify every
+//! (see `tests/bit-exact-check.md`); the GPU host uses it to re-verify every
 //! nonce the kernel reports before submitting.
 
 /// Byte offsets of each field inside the 92-byte little-endian header, and the

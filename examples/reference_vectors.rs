@@ -6,7 +6,7 @@
 //! Run:  cargo run --release --example reference_vectors
 //!
 //! The three vectors are byte-identical to those in
-//! `kernel/alphanumeric_search.cu::run_selftest`. See `tests/bit_exact_TODO.md`.
+//! `kernel/alphanumeric_search.cu::run_selftest`. See `tests/bit-exact-check.md`.
 
 use alphanumeric_gpu_miner::pow::header_hash;
 

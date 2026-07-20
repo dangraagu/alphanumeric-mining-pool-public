@@ -58,7 +58,15 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:warning=Built CUDA kernel: {}", exe_path.display());
+            // Surface the target arch on success too: an nvcc that *builds* a
+            // kernel for the wrong -arch produces an exe that fails only at
+            // RUNTIME on a mismatched GPU. Naming the arch here makes that
+            // mismatch visible instead of silent (override: ALPHANUMERIC_NVCC_ARCH).
+            println!(
+                "cargo:warning=Built CUDA kernel (-arch={arch}): {}. If this arch does not match \
+                 your GPU, rebuild with ALPHANUMERIC_NVCC_ARCH=sm_XX (see README).",
+                exe_path.display()
+            );
         }
         Ok(s) => {
             println!(
