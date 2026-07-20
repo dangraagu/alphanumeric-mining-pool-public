@@ -163,7 +163,7 @@ pub fn run(stream: TcpStream, config: &MinerConfig, gpu: &GpuConfig) -> io::Resu
             let hits = kernel.dispatch(&header_hex, &target_hex, nonce_base, count)?;
 
             for (nonce, gpu_hash) in hits {
-                // ── Re-verify on the CPU before trusting the (unvalidated) GPU.
+                // ── Re-verify each GPU hit on the CPU before trusting it.
                 let ref_hash = pow::header_hash(
                     job.number,
                     job.previous_hash,

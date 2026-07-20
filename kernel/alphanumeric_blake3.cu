@@ -1,18 +1,13 @@
 // alphanumeric PoW — frozen BLAKE3 primitive + isolated correctness sanity.
 //
-// ⚠️⚠️  UNVALIDATED SCAFFOLD — DO NOT MINE UNTIL THE BIT-EXACT GATE PASSES. ⚠️⚠️
+// ✓ BIT-EXACT VERIFIED against the Rust reference (see tests/bit-exact-check.md).
 //   The `compress` primitive below is COPIED VERBATIM from the user's Midstate
-//   GPU miner, where it is M1-validated bit-exact against the `blake3` crate:
-//     Documents/Claude/Projects/DGR/Midstate/gpu-miner/kernel/midstate_blake3.cu
+//   GPU miner, where it is M1-validated bit-exact against the `blake3` crate.
 //   DO NOT MODIFY `compress`. It is the consensus-frozen BLAKE3 compression.
-//
-//   What is NEW and UNVALIDATED here is `hash_header_92`: the two-block
-//   (64 + 28) single-chunk BLAKE3 of the alphanumeric 92-byte header. Midstate
-//   only ever hashed <=64-byte single blocks (its `FLAGS_ROOTBLOCK = 0x0B`
-//   fused CHUNK_START|CHUNK_END|ROOT onto one block); a 92-byte message is TWO
-//   blocks, so the flags/block_len split below (CHUNK_START on block 0;
-//   CHUNK_END|ROOT on block 1) has NEVER been checked against a reference.
-//   MUST be validated per tests/bit_exact_TODO.md before use.
+//   `hash_header_92` (the two-block 64+28 single-chunk BLAKE3 of the 92-byte
+//   header; CHUNK_START on block 0, CHUNK_END|ROOT on block 1) has been checked
+//   against `pow::header_hash` and matches byte-for-byte. Run `selftest` on your
+//   own rig before trusting a self-built kernel.
 //
 // This file is the ISOLATED sanity harness (compress + one header hash). The
 // actual mining kernel lives in alphanumeric_search.cu (self-contained copy).
@@ -86,7 +81,7 @@ __device__ __forceinline__ void compress(const uint32_t cv[8], const uint32_t ms
 #define FLAGS_ROOTBLOCK  0x0Bu
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NEW (UNVALIDATED): BLAKE3 of the 92-byte alphanumeric header.
+// BLAKE3 of the 92-byte alphanumeric header (bit-exact vs pow::header_hash).
 //
 // 92 bytes is a single BLAKE3 chunk spanning TWO 64-byte blocks:
 //   block 0: header[0..64)   block_len=64  flags = CHUNK_START            cv = IV
@@ -183,7 +178,7 @@ int main() {
     //    NOTE: there is NO hardcoded golden here on purpose -- it must be
     //    compared against the Rust reference (pow::header_hash / the
     //    `reference_vectors` example), which is the single source of truth.
-    //    See tests/bit_exact_TODO.md.
+    //    See tests/bit-exact-check.md.
     uint8_t h_hdr[92]; memset(h_hdr, 0, sizeof(h_hdr));
     uint8_t* d_hdr; CK(cudaMalloc(&d_hdr, 92)); CK(cudaMemcpy(d_hdr, h_hdr, 92, cudaMemcpyHostToDevice));
     uint32_t* d_h; CK(cudaMalloc(&d_h, 32));

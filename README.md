@@ -11,7 +11,9 @@ This miner is **endpoint-locked** to the official alphanumeric G-pool
 (`alphanumeric.yamaduo.no:3777`) — there is no `--pool` flag, so it always mines
 the real pool. Rewards pay to **your own** address (`--address`, required).
 
-**1. Build the CUDA kernel** (needs the NVIDIA CUDA Toolkit / `nvcc`):
+**1. Build the CUDA kernel** (needs the NVIDIA CUDA Toolkit / `nvcc` — and on
+**Windows** the MSVC C++ compiler; build from the *"x64 Native Tools Command
+Prompt for VS 2022"* so `cl.exe` is on PATH, else `nvcc` fails — see Prerequisites):
 
 ```
 nvcc -O3 -arch=sm_XX -o kernel/alphanumeric_search.exe kernel/alphanumeric_search.cu
@@ -30,6 +32,8 @@ cargo run --release --example reference_vectors   # prints reference A/B/C -- MU
 **3. Mine** (use YOUR 40-char lowercase-hex payout address):
 
 ```
+# if you built the kernel manually in step 1, also pass:
+#   --kernel kernel/alphanumeric_search.exe   (drop the .exe on Linux)
 ./target/release/alphanumeric-gpu-miner --address <your-40-hex-address> --worker rig1
 ```
 
@@ -98,6 +102,13 @@ Prerequisites:
 - **CUDA Toolkit / `nvcc`** — only needed to build the GPU kernel. On the mining
   box: nvcc 13.3, RTX 5070 Ti (Blackwell, compute capability **sm_120**),
   driver 596.49.
+- **Windows only: MSVC C++ Build Tools** (`cl.exe`) — `nvcc` needs a host C++
+  compiler. Install "Visual Studio Build Tools" (Desktop development with C++)
+  and build from the **"x64 Native Tools Command Prompt for VS 2022"** (or run
+  `vcvars64.bat` first). Without `cl.exe` on PATH, `nvcc` fails — and note that
+  `cargo build --release` still prints `Finished` (the kernel error is only a
+  cargo warning), so confirm you saw the `Built CUDA kernel` line, or you'll hit
+  "CUDA kernel not found" at runtime.
 
 ```
 cargo build --release          # builds host; build.rs runs nvcc if available

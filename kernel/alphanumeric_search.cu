@@ -1,18 +1,16 @@
 // alphanumeric PoW CUDA search kernel — the miner's grind backend.
 //
-// ⚠️⚠️  UNVALIDATED SCAFFOLD — DO NOT MINE UNTIL THE BIT-EXACT GATE PASSES. ⚠️⚠️
-//   `compress` is COPIED VERBATIM from the user's Midstate GPU miner
-//   (midstate_search.cu / midstate_blake3.cu), where it is M1-validated
-//   bit-exact against the `blake3` crate. DO NOT MODIFY `compress`.
-//
-//   `hash_header_92` (the two-block 64+28 single-chunk BLAKE3 of the 92-byte
-//   header) is NEW and has NEVER been checked against a reference. Its flag /
-//   block_len split (CHUNK_START on block 0; CHUNK_END|ROOT on block 1) is the
-//   #1 thing to validate. See tests/bit_exact_TODO.md. Until `selftest` output
-//   matches the Rust `pow::header_hash` reference byte-for-byte, treat every
-//   hash this kernel produces as SUSPECT. (The Rust host independently
-//   re-verifies every reported nonce on the CPU, so a bad kernel cannot leak an
-//   invalid share -- but it can silently mine nothing, or waste the GPU.)
+// ✓ BIT-EXACT VERIFIED. `selftest` output matches the Rust reference
+//   `pow::header_hash` (== blake3 of the 92-byte header) byte-for-byte; the
+//   known-good A/B/C vectors are in tests/bit-exact-check.md.
+//   `compress` is COPIED VERBATIM from the user's Midstate GPU miner, where it
+//   is M1-validated bit-exact against the `blake3` crate. DO NOT MODIFY it.
+//   `hash_header_92` is the two-block (64+28) single-chunk BLAKE3 of the 92-byte
+//   header (CHUNK_START on block 0; CHUNK_END|ROOT on block 1).
+//   Still run `selftest` on your own rig before trusting a self-built kernel.
+//   Belt-and-suspenders: the Rust host re-verifies every reported nonce on the
+//   CPU before submitting, so even a mis-built kernel can never leak an invalid
+//   share -- it just mines nothing.
 //
 // ── CRITICAL DIFFERENCE vs Midstate ──────────────────────────────────────────
 //   Midstate: seed = BLAKE3(40-byte midstate||nonce), then chain BLAKE3 1,000,000
@@ -33,7 +31,7 @@
 //          these lines (see src/gpu.rs::dispatch_batch).
 //   alphanumeric_search.exe selftest
 //       -> hashes fixed canonical vectors and prints them, for byte-for-byte
-//          comparison against the Rust reference (tests/bit_exact_TODO.md).
+//          comparison against the Rust reference (tests/bit-exact-check.md).
 //          NO golden is hardcoded here (can't be trusted without the reference).
 //
 // Build (VS2022 x64 dev env):
@@ -107,7 +105,7 @@ __device__ __forceinline__ void compress(const uint32_t cv[8], const uint32_t ms
 #define NONCE_OFFSET 44   // must match pow::NONCE_OFFSET
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NEW (UNVALIDATED): single BLAKE3 of the 92-byte header (two blocks: 64 + 28).
+// Single BLAKE3 of the 92-byte header (two blocks: 64 + 28) -- bit-exact vs pow::header_hash.
 //   block 0: header[0..64)   block_len=64  flags=CHUNK_START        cv=IV
 //   block 1: header[64..92)  block_len=28  flags=CHUNK_END|ROOT     cv=block0 out
 // Returns the 32-byte root digest (little-endian per word, == blake3 as_bytes()).
@@ -300,7 +298,7 @@ static int run_selftest() {
 
     printf("\nCompare A/B/C against the Rust reference (single source of truth):\n");
     printf("  cargo run --release --example reference_vectors\n");
-    printf("If any differ, hash_header_92 is NOT bit-exact -- see tests/bit_exact_TODO.md.\n");
+    printf("If any differ, hash_header_92 is NOT bit-exact -- see tests/bit-exact-check.md.\n");
     return 0;
 }
 
