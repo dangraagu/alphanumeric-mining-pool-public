@@ -21,7 +21,8 @@ Set `sm_XX` to your GPU's compute capability (e.g. `sm_86` RTX 30xx, `sm_89`
 RTX 40xx, `sm_120` RTX 50xx). **Verify bit-exactness before mining:**
 
 ```
-kernel/alphanumeric_search.exe selftest      # must match tests/reference_vectors
+kernel/alphanumeric_search.exe selftest      # prints GPU hashes A/B/C
+cargo run --release --example reference_vectors   # prints reference A/B/C -- MUST match
 ```
 
 **2. Build the miner:** `cargo build --release`

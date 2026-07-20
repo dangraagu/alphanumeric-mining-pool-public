@@ -1,14 +1,24 @@
-# BIT-EXACT VALIDATION — MUST PASS BEFORE MINING
+# BIT-EXACT VALIDATION — VERIFIED ✓
 
-**Status: NOT DONE. The CUDA kernel `hash_header_92` is UNVALIDATED.**
+**Status: VALIDATED. The CUDA kernel `hash_header_92` is bit-exact vs the Rust
+reference `pow::header_hash` (== `blake3::hash` of the 92-byte header).**
 
-The GPU kernel computes BLAKE3 of the 92-byte alphanumeric header. The BLAKE3
-`compress` primitive is copied verbatim from the user's Midstate GPU miner and
-is already M1-validated bit-exact — but the **two-block (64 + 28) single-chunk
-assembly** in `hash_header_92` is NEW and has never been checked against a
-reference. It must match the Rust reference `pow::header_hash`
-(== `blake3::hash(header_92_bytes)`) exactly, or every block/share the GPU finds
-is worthless.
+Self-verify on your own rig before mining (~30 s) — all three must match
+byte-for-byte:
+
+```
+cargo run --release --example reference_vectors   # prints reference A/B/C
+kernel/alphanumeric_search.exe selftest           # prints GPU A/B/C
+```
+
+Known-good vectors:
+- A = 3de3066b89c248c164499e2303a9d7c779dc7dfbe12f9701535f4a223a56f357
+- B = 6a11c904a61ab392f678049cda38ce03f37efd39488225387e3b2f464cdae764
+- C = 5a779d8820daf993979422d0f6632429ffdf28dcd617b0dc60844e3e88214c7c
+
+Belt-and-suspenders: the Rust host ALSO re-verifies every nonce the GPU reports
+against `pow::header_hash` before submitting, so even a mis-built kernel can
+never leak an invalid share upstream — it just mines nothing.
 
 ## The reference (source of truth)
 
