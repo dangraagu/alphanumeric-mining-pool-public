@@ -12,6 +12,13 @@
 *.cubin
 *.fatbin
 
+# Runtime / deploy working dir (built binaries, .bak, live logs)
+/live/
+*.bak
+miner.out
+miner.err
+*.log
+
 # Editor / OS cruft
 *.swp
 .DS_Store

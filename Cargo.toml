@@ -2,7 +2,7 @@
 name = "alphanumeric-gpu-miner"
 version = "0.3.0"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 description = "CUDA GPU miner for the alphanumeric mining pool (a#) share-distribution protocol. Speaks the identical wire protocol as the CPU miner; grinds nonces on the GPU via a single-BLAKE3-of-a-92-byte-header kernel adapted from the Midstate GPU miner."
 publish = false
 

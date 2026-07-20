@@ -5,17 +5,41 @@ share-distribution protocol. It speaks the byte-identical wire protocol as the
 CPU miner (`alphanumeric-mining-pool-public`) but grinds nonces on an NVIDIA GPU
 instead of the CPU.
 
-> ## ⚠️ THIS IS AN UNVALIDATED SCAFFOLD — DO NOT MINE YET ⚠️
-> The CUDA hash kernel (`hash_header_92` in `kernel/alphanumeric_search.cu`) has
-> **not** been checked bit-for-bit against the reference. Until the
-> [`tests/bit_exact_TODO.md`](tests/bit_exact_TODO.md) gate passes **and** a
-> real-rig canary share is accepted by the live pool, treat this as draft code.
-> It has never been compiled in this environment (no GPU/nvcc here). A wrong
-> hash = every block/share is invalid.
->
-> Safety net that IS in place: the Rust host re-verifies every nonce the GPU
-> reports with the CPU reference (`pow::header_hash`) before submitting, so a
-> broken kernel cannot leak an invalid share upstream — it just mines nothing.
+## Quick start — join the pool
+
+This miner is **endpoint-locked** to the official alphanumeric G-pool
+(`alphanumeric.yamaduo.no:3777`) — there is no `--pool` flag, so it always mines
+the real pool. Rewards pay to **your own** address (`--address`, required).
+
+**1. Build the CUDA kernel** (needs the NVIDIA CUDA Toolkit / `nvcc`):
+
+```
+nvcc -O3 -arch=sm_XX -o kernel/alphanumeric_search.exe kernel/alphanumeric_search.cu
+```
+
+Set `sm_XX` to your GPU's compute capability (e.g. `sm_86` RTX 30xx, `sm_89`
+RTX 40xx, `sm_120` RTX 50xx). **Verify bit-exactness before mining:**
+
+```
+kernel/alphanumeric_search.exe selftest      # must match tests/reference_vectors
+```
+
+**2. Build the miner:** `cargo build --release`
+
+**3. Mine** (use YOUR 40-char lowercase-hex payout address):
+
+```
+./target/release/alphanumeric-gpu-miner --address <your-40-hex-address> --worker rig1
+```
+
+Optional flags: `--batch <nonces>` (default 67108864; **bigger = higher GPU
+util** — try `--batch 1073741824` on a fast card for ~full utilization),
+`--device <gpu-index>`, `--kernel <path>`.
+
+> Correctness net: the Rust host re-verifies every nonce the GPU reports against
+> the CPU BLAKE3 reference (`pow::header_hash`) before submitting, so a mis-built
+> kernel can never leak an invalid share — it just mines nothing. Always run
+> `selftest` first.
 
 ## What it is (and what hash family)
 

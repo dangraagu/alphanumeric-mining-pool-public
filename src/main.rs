@@ -13,7 +13,10 @@ use alphanumeric_gpu_miner::gpu::{self, GpuConfig, MinerConfig};
 use alphanumeric_gpu_miner::protocol::is_valid_address;
 use alphanumeric_gpu_miner::update::UpdateOptions;
 
-const DEFAULT_POOL_ADDR: &str = "127.0.0.1:3777";
+// Hardcoded, endpoint-LOCKED pool address: this miner mines ONLY the official
+// alphanumeric G-pool. There is deliberately no `--pool` flag, so a copy can't
+// be repointed at a competing pool (see LICENSE: PolyForm Noncommercial 1.0.0).
+const POOL_ENDPOINT: &str = "alphanumeric.yamaduo.no:3777";
 const DEFAULT_WORKER: &str = "gpu-worker";
 /// Nonces per GPU dispatch. 2^22 amortises subprocess-spawn overhead while
 /// staying well under the kernel's `u32` count limit. Tune per GPU / batch time.
@@ -43,11 +46,12 @@ struct Args {
 
 fn print_usage() {
     eprintln!(
-        "Usage: alphanumeric-gpu-miner --address <40-hex-address> [--pool <host:port>] [--worker <label>]\n\
+        "Usage: alphanumeric-gpu-miner --address <40-hex-address> [--worker <label>]\n\
          \x20                            [--device <gpu-index>] [--batch <nonces>] [--kernel <path>]\n\
          \n\
+         Mines the official alphanumeric G-pool ({POOL_ENDPOINT}) -- endpoint is fixed.\n\
+         \n\
          --address   required. Your 40-character lowercase hex alphanumeric payout address.\n\
-         --pool      optional. Pool TCP address, default: {DEFAULT_POOL_ADDR}\n\
          --worker    optional. Worker label sent on authorize, default: {DEFAULT_WORKER}\n\
          --device    optional. CUDA device index (via CUDA_VISIBLE_DEVICES), default: 0.\n\
          --batch     optional. Nonces per GPU dispatch (1..=4294967295), default: {DEFAULT_BATCH}.\n\
@@ -61,7 +65,8 @@ fn print_usage() {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut pool = DEFAULT_POOL_ADDR.to_string();
+    // Endpoint-locked: not overridable at runtime (no `--pool` flag).
+    let pool = POOL_ENDPOINT.to_string();
     let mut worker = DEFAULT_WORKER.to_string();
     let mut address: Option<String> = None;
     let mut device: Option<usize> = None;
@@ -73,7 +78,6 @@ fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--pool" => pool = args.next().ok_or("--pool requires a value")?,
             "--address" => address = Some(args.next().ok_or("--address requires a value")?),
             "--worker" => worker = args.next().ok_or("--worker requires a value")?,
             "--device" => {
